@@ -35,6 +35,8 @@ kubectl cp ./secrets-export.sh ${K8S_POD_NAME}:/tmp/test/secrets-export.sh
 # Temporarily disable `set -e` for this command to capture the exit code
 set +e
 kubectl exec ${K8S_POD_NAME} -- bash -c "cd /tmp/test && source secrets-export.sh && ${K8S_TEST_CMD}"
+echo -e "\n POD STORAGE USAGE:\n"
+kubectl exec ${K8S_POD_NAME} -- df -h
 EXIT_CODE=$?  # Capture the exit code
 set -e  # Re-enable `set -e` for safety
 if [ $EXIT_CODE -eq 137 ]; then
