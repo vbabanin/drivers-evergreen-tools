@@ -545,7 +545,7 @@ def run(opts):
 
         # Create N clusters
         uris = []
-        cluster_count = int(getattr(opts, "cluster_count", 1))
+        cluster_count = int(getattr(opts, "cluster_count", None) or 1)
 
         LOGGER.info(f"Starting {cluster_count} cluster(s)...")
 
