@@ -371,12 +371,14 @@ def get_orchestration_data(opts):
 
 
 def modify_ports_for_cluster(data: dict, cluster_index: int) -> dict:
-    """Modify orchestration config to use different ports for each cluster.
+    """Modify orchestration config to use different ports and IDs for each cluster.
 
     Each cluster gets a port offset of 100 to avoid conflicts:
     - Cluster 0: 27017, 27018, 27019...
     - Cluster 1: 27117, 27118, 27119...
     - Cluster 2: 27217, 27218, 27219...
+
+    Each cluster also gets unique IDs to avoid mongo-orchestration conflicts.
     """
     import copy
 
@@ -403,6 +405,18 @@ def modify_ports_for_cluster(data: dict, cluster_index: int) -> dict:
         for router in cluster_data["routers"]:
             if "port" in router:
                 router["port"] += port_offset
+
+    # Make IDs unique per cluster to avoid mongo-orchestration "already exists" errors
+    if cluster_index > 0:
+        suffix = f"_{cluster_index}"
+        # Top-level id (e.g., "repl0", "standalone", "shard_cluster_1")
+        if "id" in cluster_data:
+            cluster_data["id"] += suffix
+        # Shard-level ids in sharded clusters
+        if "shards" in cluster_data:
+            for shard in cluster_data["shards"]:
+                if "id" in shard:
+                    shard["id"] += suffix
 
     return cluster_data
 
