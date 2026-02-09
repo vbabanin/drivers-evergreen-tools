@@ -86,6 +86,12 @@ def get_options():
         parser.add_argument(
             "--orchestration-file", help="The name of the orchestration config file"
         )
+        parser.add_argument(
+            "--cluster-count",
+            type=int,
+            default=1,
+            help="Number of clusters to spawn for parallel testing (default: 1)",
+        )
 
     other_group = parser.add_argument_group("Other options")
     if command == "run":
@@ -364,6 +370,43 @@ def get_orchestration_data(opts):
     return data
 
 
+def modify_ports_for_cluster(data: dict, cluster_index: int) -> dict:
+    """Modify orchestration config to use different ports for each cluster.
+
+    Each cluster gets a port offset of 100 to avoid conflicts:
+    - Cluster 0: 27017, 27018, 27019...
+    - Cluster 1: 27117, 27118, 27119...
+    - Cluster 2: 27217, 27218, 27219...
+    """
+    import copy
+
+    cluster_data = copy.deepcopy(data)
+    port_offset = cluster_index * 100
+
+    def update_ports(obj):
+        if isinstance(obj, dict):
+            if "port" in obj:
+                obj["port"] += port_offset
+            for key, value in obj.items():
+                if key == "routers":
+                    continue
+                if isinstance(value, (dict, list)):
+                    update_ports(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                update_ports(item)
+
+    update_ports(cluster_data)
+
+    # Also update router ports if present
+    if "routers" in cluster_data:
+        for router in cluster_data["routers"]:
+            if "port" in router:
+                router["port"] += port_offset
+
+    return cluster_data
+
+
 def clean_run(opts):
     mdb_binaries = Path(opts.mongodb_binaries)
     mdb_binaries_str = normalize_path(mdb_binaries)
@@ -471,45 +514,81 @@ def run(opts):
     mo_start = datetime.now()
 
     if opts.local_atlas:
+        # For local atlas, only support single cluster
+        if opts.cluster_count > 1:
+            LOGGER.warning(
+                "Multiple clusters not supported with --local-atlas, using cluster_count=1"
+            )
+            opts.cluster_count = 1
         uri = start_atlas(opts)
+        uris = [uri]
     else:
         mo_home = Path(opts.mongo_orchestration_home)
         data = get_orchestration_data(opts)
 
-        # Write the config file.
-        orch_file = Path(mo_home / "config.json")
-        orch_file.write_text(json.dumps(data, indent=2))
-
-        # Start the orchestration.
+        # Start the orchestration server once
         start(opts)
 
-        # Configure the server.
-        LOGGER.info("Starting deployment...")
-        url = f"http://localhost:8889/v1/{opts.topology}s"
-        req = urllib.request.Request(
-            url, data=json.dumps(data).encode("utf-8"), method="POST"
-        )
-        try:
-            resp = urllib.request.urlopen(req)
-        except urllib.error.HTTPError as e:
-            stop(opts)
-            LOGGER.error("out.log: %s", (mo_home / "out.log").read_text())
-            LOGGER.error("server.log: %s", (mo_home / "server.log").read_text())
-            raise e
-        resp = json.loads(resp.read().decode("utf-8"))
-        LOGGER.debug(resp)
-        LOGGER.info("Starting deployment... done.")
-        uri = resp.get("mongodb_auth_uri", resp["mongodb_uri"])
+        # Create N clusters
+        uris = []
+        cluster_count = getattr(opts, "cluster_count", 1)
 
-    # Handle the cluster uri.
+        LOGGER.info(f"Starting {cluster_count} cluster(s)...")
+
+        for cluster_idx in range(cluster_count):
+            # Modify ports for this cluster
+            cluster_data = modify_ports_for_cluster(data, cluster_idx)
+
+            # Write config file for this cluster
+            orch_file = Path(mo_home / f"config_{cluster_idx}.json")
+            orch_file.write_text(json.dumps(cluster_data, indent=2))
+
+            # Deploy this cluster
+            LOGGER.info(f"Starting cluster {cluster_idx + 1}/{cluster_count}...")
+            url = f"http://localhost:8889/v1/{opts.topology}s"
+            req = urllib.request.Request(
+                url, data=json.dumps(cluster_data).encode("utf-8"), method="POST"
+            )
+            try:
+                resp = urllib.request.urlopen(req)
+            except urllib.error.HTTPError as e:
+                stop(opts)
+                LOGGER.error("out.log: %s", (mo_home / "out.log").read_text())
+                LOGGER.error("server.log: %s", (mo_home / "server.log").read_text())
+                raise e
+
+            resp_data = json.loads(resp.read().decode("utf-8"))
+            LOGGER.debug(resp_data)
+            uri = resp_data.get("mongodb_auth_uri", resp_data["mongodb_uri"])
+            uris.append(uri)
+            LOGGER.info(f"Cluster {cluster_idx + 1} URI: {uri}")
+
+        LOGGER.info(f"All {cluster_count} cluster(s) started successfully")
+
+    # Export URIs
     MO_EXPANSION_YML.touch()
-    MO_EXPANSION_YML.write_text(
-        MO_EXPANSION_YML.read_text() + f'\nMONGODB_URI: "{uri}"'
-    )
     MO_EXPANSION_SH.touch()
-    MO_EXPANSION_SH.write_text(MO_EXPANSION_SH.read_text() + f'\nMONGODB_URI="{uri}"')
-    URI_TXT.write_text(uri)
-    LOGGER.info(f"Cluster URI: {uri}")
+
+    # Export MONGO_URIS (semicolon-separated list of all URIs) only for multi-cluster
+    if len(uris) > 1:
+        mongo_uris_csv = ";".join(uris)
+        MO_EXPANSION_YML.write_text(
+            MO_EXPANSION_YML.read_text() + f'\nMONGO_URIS: "{mongo_uris_csv}"'
+        )
+        MO_EXPANSION_SH.write_text(
+            MO_EXPANSION_SH.read_text() + f'\nMONGO_URIS="{mongo_uris_csv}"'
+        )
+        LOGGER.info(f"MONGO_URIS: {mongo_uris_csv}")
+
+    # Export MONGODB_URI (first cluster, for backwards compatibility)
+    MO_EXPANSION_YML.write_text(
+        MO_EXPANSION_YML.read_text() + f'\nMONGODB_URI: "{uris[0]}"'
+    )
+    MO_EXPANSION_SH.write_text(
+        MO_EXPANSION_SH.read_text() + f'\nMONGODB_URI="{uris[0]}"'
+    )
+    URI_TXT.write_text(uris[0])
+    LOGGER.info(f"MONGODB_URI (primary): {uris[0]}")
 
     # Write the results file.
     mo_end = datetime.now()
